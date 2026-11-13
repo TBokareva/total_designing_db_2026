@@ -17,6 +17,7 @@ BEGIN
         client_address,
         product,
         restaurant,
+        legal_entity,
         product_category,
         client,
         courier,

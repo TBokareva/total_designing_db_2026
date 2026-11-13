@@ -1,9 +1,12 @@
 -- FOOD-109 пользователь inspector
--- запускать под postgres в той базе куда восстановили бэкап:
---   psql -U postgres -d <база> -f db/schema/grants.sql
--- повторный запуск ничего не ломает
+-- Бэкап восстанавливается в базу foodexpress_bokareva (по имени файла бэкапа), права выдаются
+-- на неё. Запускать под postgres, подключившись к этой базе:
+--   psql -U postgres -d foodexpress_bokareva -f db/schema/grants.sql
 
--- у create role нет if not exists, поэтому так
+-- Создаю роль, только если её ещё нет. Если inspector уже существует, её не трогаю:
+-- пароль и другие настройки чужой учётной записи скрипт менять не должен.
+-- У CREATE ROLE нет IF NOT EXISTS, поэтому проверка в DO-блоке; без неё повторный
+-- запуск падал бы с ошибкой "role already exists".
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'inspector') THEN
@@ -11,50 +14,23 @@ BEGIN
     END IF;
 END
 $$;
--- на случай если роль уже была с другим паролем
-ALTER ROLE inspector WITH LOGIN PASSWORD 'NetoSQL2025';
 
--- имя базы заранее не знаю, поэтому через format
-DO $$
-BEGIN
-    EXECUTE format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO inspector', current_database());
-END
-$$;
+-- права на ту базу, куда восстанавливается бэкап
+GRANT CONNECT ON DATABASE foodexpress_bokareva TO inspector;
 
--- права на схему сами по себе не дают доступ к таблицам, поэтому отдельно на всё
+-- ALL PRIVILEGES на схему. Права на схему не дают доступа к объектам внутри неё,
+-- поэтому отдельно на таблицы (вместе с представлением how_much_money) и процедуры/функции.
+-- Последовательностей в схеме нет: все ключи uuid.
 GRANT ALL PRIVILEGES ON SCHEMA bokareva_food TO inspector;
-GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA bokareva_food TO inspector;
-GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA bokareva_food TO inspector;
-GRANT ALL PRIVILEGES ON ALL ROUTINES  IN SCHEMA bokareva_food TO inspector;
+GRANT ALL PRIVILEGES ON ALL TABLES   IN SCHEMA bokareva_food TO inspector;
+GRANT ALL PRIVILEGES ON ALL ROUTINES IN SCHEMA bokareva_food TO inspector;
+-- На типы (enum) отдельно не выдаю: USAGE на типы по умолчанию есть у PUBLIC.
 
--- типы
-DO $$
-DECLARE
-    r record;
-BEGIN
-    FOR r IN SELECT t.typname
-             FROM pg_type t
-             JOIN pg_namespace n ON n.oid = t.typnamespace
-             WHERE n.nspname = 'bokareva_food' AND t.typtype = 'e'
-    LOOP
-        EXECUTE format('GRANT ALL PRIVILEGES ON TYPE bokareva_food.%I TO inspector', r.typname);
-    END LOOP;
-END
-$$;
-
--- и на то что создадут потом
-ALTER DEFAULT PRIVILEGES IN SCHEMA bokareva_food GRANT ALL PRIVILEGES ON TABLES TO inspector;
-ALTER DEFAULT PRIVILEGES IN SCHEMA bokareva_food GRANT ALL PRIVILEGES ON SEQUENCES TO inspector;
-ALTER DEFAULT PRIVILEGES IN SCHEMA bokareva_food GRANT ALL PRIVILEGES ON ROUTINES TO inspector;
-ALTER DEFAULT PRIVILEGES IN SCHEMA bokareva_food GRANT ALL PRIVILEGES ON TYPES TO inspector;
-
--- exts нужен для uuid_generate_v4
+-- exts - для uuid_generate_v4 (AC). EXECUTE на функции по умолчанию есть у PUBLIC.
 GRANT USAGE ON SCHEMA exts TO inspector;
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA exts TO inspector;
 
--- вообще это и так есть у всех через PUBLIC, но на всякий случай явно
+-- USAGE на information_schema и pg_catalog требует AC FOOD-109: inspector должен читать
+-- каталоги (проверки G.3, G.4). У PUBLIC это право есть по умолчанию, здесь оно выдаётся
+-- именно inspector, как требует задание.
 GRANT USAGE ON SCHEMA information_schema TO inspector;
 GRANT USAGE ON SCHEMA pg_catalog         TO inspector;
-
--- чтобы после входа не писать каждый раз set search_path
-ALTER ROLE inspector SET search_path = bokareva_food, exts, public;
