@@ -5,7 +5,7 @@
 | Параметр | Значение |
 |---|---|
 | PostgreSQL version | 15.18 |
-| Дата проверки | 08.11.2026 |
+| Дата проверки | 13.11.2026 |
 | Схема | `bokareva_food` |
 | Роль-аудитор | `inspector` |
 
@@ -18,7 +18,7 @@
 ### A.1. Восстановление бэкапа
 
 Ожидается: без ошибок.
-Факт: восстановила в пустую базу со схемой `exts`, ошибок нет. Потом прогнала `grants.sql`.
+Факт: восстанавливала в базу `foodexpress_bokareva`, где есть только схема `exts` с `uuid-ossp` (BR-13.3): `pg_restore -d foodexpress_bokareva --exit-on-error foodexpress_bokareva.backup` - ошибок нет. Потом `psql -U postgres -d foodexpress_bokareva -f db/schema/grants.sql` - ошибок нет. Весь протокол дальше выполняла, подключившись как `inspector` с паролем `NetoSQL2025` (`psql -h localhost -U inspector`).
 Вердикт: OK
 
 ### A.2. Переключение на inspector
@@ -66,7 +66,7 @@ ORDER BY table_name;
 ```
 
 Ожидается: `address`, `client`, `client_address`, `courier`, `courier_pay`, `order`, `order_structure`, `payment`, `product`, `product_category`, `restaurant`, `review` (12 + N штук).
-Факт: 12 таблиц + представление `how_much_money`, которое тоже попадает в `information_schema.tables`.
+Факт: 14 строк - 13 таблиц (12 из ERD + `legal_entity`, вынесена при нормализации) и представление `how_much_money`, оно тоже попадает в `information_schema.tables`.
 
 ### B.4. Все PK — `uuid`
 
@@ -117,7 +117,7 @@ ORDER BY tbl, conname;
 ```
 
 Ожидается: не менее 15 FK, все из erd.md.
-Факт: 18 FK — все связи из erd.md и три составных.
+Факт: 19 FK - все связи из erd.md, три составных (`order_client_address_fk`, `payment_order_amount_fk`, `review_order_client_fk`) и `restaurant_legal_entity_fk`.
 
 ### B.7. Пароль — MD5
 
@@ -127,7 +127,7 @@ FROM client LIMIT 5;
 ```
 
 Ожидается: `len = 32`, hex-строка.
-Факт: `len = 32`, например `f5ef19b4680e3e147b794a3c5781c590`.
+Факт: `len = 32`, например `dd16f2fb356bced6e16de5aed3d519f6`. Строк не из 32 hex-символов - 0.
 
 ---
 
@@ -167,7 +167,7 @@ ORDER BY tbl;
 ```
 
 Ожидается: 10, 10, 10, 10, 50, 50, 50, 50, 50.
-Факт: client, courier, product_category, restaurant — по 10; address, product, order, review, payment — по 50.
+Факт: client, courier, product_category, restaurant — по 10; address, product, order, review, payment — по 50. Дополнительно: legal_entity 10, client_address 40, courier_pay 60.
 
 ### C.4. Адреса ресторанов vs клиентов (BR-11.7)
 
@@ -188,7 +188,7 @@ SELECT count(*) FROM client WHERE login = '' OR password = '' OR phone_number = 
 ```
 
 Ожидается: 0.
-Факт: 0.
+Факт: 0. По остальным текстовым полям (ФИО курьера, названия ресторана/блюда/категории, описания, текст отзыва) пустых строк тоже 0.
 
 ### C.6. Нет NULL там, где запрещено (BR-11.3)
 
@@ -208,7 +208,7 @@ SELECT count(*) FROM courier WHERE status != 'уволен';
 ```
 
 Ожидается: `>= 1`.
-Факт: 10.
+Факт: 7.
 
 ### C.8. `courier_pay` консистентен с правилами (BR-10.2)
 
@@ -227,7 +227,7 @@ LIMIT 20;
 ```
 
 Ожидается: `amount = expected_amount` в каждой строке.
-Факт: всё сходится, проверяла все 60 строк а не только 20.
+Факт: всё сходится, проверяла все 60 строк а не только 20 - расхождений 0.
 
 ### C.9. Повторный вызов не ломает
 
@@ -434,13 +434,15 @@ LIMIT 20;
 ```
 
 Ожидается: `rating = expected`.
-Факт: совпадает во всех строках. Для ресторанов аналогичный запрос тоже без расхождений.
+Факт: совпадает во всех строках (проверяла все 116 блюд с рейтингом, без LIMIT). Для ресторанов аналогичный запрос тоже без расхождений.
 
 ---
 
 ## E. Функции и процедуры
 
 ### E.1. `add_product` — успешный вызов
+
+Запрос из шаблона:
 
 ```sql
 SELECT count(*) AS before FROM product;
@@ -459,11 +461,35 @@ CALL add_product(
 SELECT count(*) AS after FROM product;
 ```
 
+В таком виде не выполняется: `ERROR: cannot use subquery in CALL argument`. Это ограничение PostgreSQL - в аргументах `CALL` подзапрос нельзя, а `add_product` по AC FOOD-104 именно процедура. Поэтому id ресторана и категории беру заранее через `\gset` (команда psql: сохраняет результат запроса в переменные) и подставляю.
+
+Рабочий вариант (psql):
+
+```sql
+SELECT count(*) AS before FROM product;
+
+SELECT restaurant_id AS rid FROM restaurant LIMIT 1 \gset
+SELECT product_category_id AS cid FROM product_category LIMIT 1 \gset
+
+CALL add_product(
+    p_restaurant_id => :'rid',
+    p_product_category_id => :'cid',
+    p_name => 'Тестовое блюдо',
+    p_price => 250,
+    p_rating => 4.5,
+    p_status => 'доступно',
+    p_description => 'Описание'
+);
+
+SELECT count(*) AS after FROM product;
+```
+
 Ожидается: `after = before + 1`.
 Факт: `before = 550`, `after = 551`.
-Запрос как в шаблоне не запускается - `cannot use subquery in CALL argument`, в CALL нельзя подзапрос. Вытащила id ресторана и категории заранее через `\gset` и подставила.
 
 ### E.2. `add_product` — падает на несуществующий ресторан
+
+Запрос из шаблона:
 
 ```sql
 CALL add_product(
@@ -472,10 +498,28 @@ CALL add_product(
 );
 ```
 
+В шаблоне вместо остальных аргументов комментарий, в таком виде это синтаксическая ошибка. Рабочий вариант - категория настоящая (`:'cid'` из E.1), ресторана с таким id нет:
+
+```sql
+CALL add_product(
+    p_restaurant_id => '00000000-0000-0000-0000-000000000000',
+    p_product_category_id => :'cid',
+    p_name => 'Тестовое блюдо',
+    p_price => 250
+);
+```
+
 Ожидается: ошибка с внятным сообщением.
-Факт: `ERROR: add_product: ресторан с id 00000000-0000-0000-0000-000000000000 не существует`
+Факт:
+```
+ERROR:  insert or update on table "product" violates foreign key constraint "product_restaurant_fk"
+DETAIL:  Key (restaurant_id)=(00000000-0000-0000-0000-000000000000) is not present in table "restaurant".
+```
+Ошибку даёт сам FK `product_restaurant_fk`, своих проверок в процедуре нет. Из названия ограничения и DETAIL видно, что нарушено и какое значение не найдено. Аналогично для категории - `product_category_fk`, для отрицательной цены - `product_price_chk`.
 
 ### E.3. `rating_change` — пересчитывает рейтинг
+
+Запрос из шаблона:
 
 ```sql
 -- Выбрать заказ, блюдо и клиента
@@ -497,11 +541,38 @@ VALUES (
 SELECT rating FROM product WHERE product_id = <product_id>;
 ```
 
+Здесь клиент, заказ и блюдо берутся `LIMIT 1` из разных таблиц и между собой не связаны. Кроме того, `<product_id>` - заглушка, её надо заменить настоящим id. Но и с настоящим id схема такой отзыв не пропустит: это отзыв на то, чего клиент не заказывал (BR-9.2). Какая проверка сработает, зависит от данных: составной FK `review_order_client_fk` (заказ не этого клиента), триггер `review_entity_check` (блюда нет в заказе) или UNIQUE `review_one_per_entity_uq` (отзыв на это блюдо в этом заказе уже есть, BR-9.5). Когда проверяла, подставив id блюда, получила `duplicate key value violates unique constraint "review_one_per_entity_uq"`; клиент при этом тоже был не тот, что в заказе. Поэтому клиента, заказ и блюдо беру из одного доставленного заказа, где на это блюдо ещё нет отзыва. Блюдо с рейтингом ниже 4 - чтобы отзыв с оценкой 5 точно изменил рейтинг.
+
+Рабочий вариант (psql):
+
+```sql
+SELECT os.order_id AS e3_order, o.client_id AS e3_client, os.product_id AS e3_product
+FROM order_structure os
+JOIN "order" o  USING (order_id)
+JOIN product p  USING (product_id)
+WHERE p.rating < 4
+  AND o.status = 'доставлен'
+  AND NOT EXISTS (SELECT 1 FROM review r
+                  WHERE r.order_id = os.order_id
+                    AND r.entity_type = 'блюдо'
+                    AND r.entity_id = os.product_id)
+LIMIT 1 \gset
+
+SELECT rating FROM product WHERE product_id = :'e3_product';
+
+INSERT INTO review (client_id, entity_id, entity_type, order_id, description, rating)
+VALUES (:'e3_client', :'e3_product', 'блюдо', :'e3_order', 'Тестовый отзыв', 5)
+RETURNING review_id AS e3_review \gset
+
+SELECT rating FROM product WHERE product_id = :'e3_product';
+```
+
 Ожидается: `rating` пересчитан.
-Факт: до вставки `NULL`, после — `5.00`.
-Если брать клиента, заказ и блюдо как в шаблоне (просто LIMIT 1 из разных таблиц), схема такой отзыв не пропустит - это отзыв на то, чего клиент не заказывал (BR-9.2). Поэтому взяла всё из одного заказа.
+Факт: у блюда был 1 отзыв и `rating = 3.00`; после отзыва с оценкой 5 - `4.00` (= среднее по 2 отзывам).
 
 ### E.4. `rating_change` — удаление отзыва
+
+Запрос из шаблона:
 
 ```sql
 -- Удалить отзыв из E.3
@@ -510,8 +581,20 @@ DELETE FROM review WHERE review_id = <review_id>;
 SELECT rating FROM product WHERE product_id = <product_id>;
 ```
 
+Рабочий вариант - id отзыва и блюда из переменных E.3. Дополнительно в транзакции удаляю все отзывы на блюдо, чтобы проверить `rating IS NULL`, и откатываю:
+
+```sql
+DELETE FROM review WHERE review_id = :'e3_review';
+SELECT rating FROM product WHERE product_id = :'e3_product';
+
+BEGIN;
+DELETE FROM review WHERE entity_type = 'блюдо' AND entity_id = :'e3_product';
+SELECT rating FROM product WHERE product_id = :'e3_product';
+ROLLBACK;
+```
+
 Ожидается: если других отзывов нет — `rating IS NULL`; иначе — пересчитан.
-Факт: `NULL`.
+Факт: `3.00` - пересчитан обратно по оставшемуся отзыву. После удаления всех отзывов на это блюдо - `rating IS NULL` (транзакцию откатила).
 
 ### E.5. `get_statistic()`
 
@@ -524,7 +607,7 @@ SELECT * FROM get_statistic();
 - По одной строке на ресторан.
 - `best_user` = `client.login` (не NULL при наличии заказов).
 
-Факт: колонки совпадают; 110 строк на 110 ресторанов; у ресторанов с заказами `best_product_name` и `best_user` заполнены.
+Факт: колонки совпадают; 110 строк на 110 ресторанов; `total_amount < avg_amount` - 0 строк; у ресторанов с заказами `best_product_name` и `best_user` заполнены везде; все `best_user` - логины из `client`.
 
 ### E.6. `courier_salary()`
 
@@ -547,7 +630,7 @@ LIMIT 20;
 - У уволенных — не изменился.
 - `courier_pay` содержит запись за текущий месяц.
 
-Факт: коэффициент пересчитан у 85 работающих курьеров, у уволенных не изменился; за 2026-11 есть по одной записи на каждого из 110 курьеров.
+Факт: у всех 83 работающих курьеров новый коэффициент соответствует BR-10.2 по числу доставок за месяц, у 27 уволенных не изменился; за 2026-11 есть по одной записи на каждого из 110 курьеров, `coefficient_used` у всех = коэффициенту до вызова.
 
 ### E.7. `courier_salary()` — повторный вызов
 
@@ -595,7 +678,7 @@ WHERE sum_no_commission = 0 OR sum_no_commission IS NULL;
 ```
 
 Ожидается: если в какие-то месяцы заказов не было — они есть в результате.
-Факт: пусто, в сгенерированных данных заказы есть в каждом месяце. Чтобы проверить, удалила в транзакции все заказы за август и откатила - август остался в отчёте с нулями.
+Факт: пусто, в сгенерированных данных заказы есть в каждом месяце. Чтобы проверить, удалила в транзакции все заказы за август (вместе с их отзывами и оплатами) и откатила - август остался в отчёте с нулями.
 
 ### F.4. Корректность сумм
 
@@ -648,7 +731,7 @@ GROUP BY table_name;
 ```
 
 Ожидается: у каждой таблицы `SELECT, INSERT, UPDATE, DELETE` (или `ALL`).
-Факт: у всех таблиц и у представления — полный набор прав (`ALL`).
+Факт: у всех 13 таблиц и у представления — полный набор прав: `DELETE, INSERT, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE` (`ALL`).
 
 ### G.3. `information_schema` читается под `inspector`
 
@@ -660,7 +743,7 @@ RESET ROLE;
 ```
 
 Ожидается: 12 + N (количество таблиц).
-Факт: 13 (12 таблиц + представление).
+Факт: 14 (13 таблиц + представление).
 
 ### G.4. `pg_catalog` читается под `inspector`
 
@@ -672,7 +755,7 @@ RESET ROLE;
 ```
 
 Ожидается: 12 + N.
-Факт: 12.
+Факт: 13.
 
 ### G.5. Все процедуры/функции работают под `inspector`
 
@@ -707,7 +790,7 @@ FROM courier c;
 ```
 
 Ожидается: два SubPlan, каждый — скан `"order"`. Время растёт линейно от числа курьеров.
-Факт: время 0.904 мс, план: Seq Scan on courier + два SubPlan, каждый читает `"order"` 110 раз (loops=110).
+Факт: время 1.037 мс, план: Seq Scan on courier + два SubPlan, каждый читает `"order"` 10 раз (loops=10 - после G.5 в базе 10 курьеров).
 
 ### H.2. `EXPLAIN ANALYZE` — паттерн «один JOIN»
 
@@ -722,7 +805,7 @@ GROUP BY c.courier_id;
 ```
 
 Ожидается: один `Hash Right Join` / `Hash Left Join`, один скан `"order"`. Время меньше, чем в H.1.
-Факт: время 0.350 мс, план: HashAggregate → Hash Left Join, `"order"` читается один раз.
+Факт: время 0.165 мс, план: HashAggregate → Hash Left Join, `"order"` читается один раз.
 
 ### H.3. Применить к `get_statistic`
 
@@ -731,7 +814,7 @@ EXPLAIN ANALYZE SELECT * FROM get_statistic();
 ```
 
 Ожидается: без `LATERAL`, без множественных подзапросов к одной таблице, без оконных функций там, где хватает агрегата.
-Факт: `LATERAL`, SubPlan и WindowAgg нет; `"order"` читается один раз в CTE `delivered`, остальные таблицы — тоже по одному разу.
+Факт: `LATERAL`, SubPlan и WindowAgg нет, `DISTINCT ON` тоже; `"order"` читается один раз в CTE `delivered`, остальные таблицы — тоже по одному разу. Время 2.1 мс.
 На саму функцию explain показывает только `Function Scan`, внутрь не заглядывает - поэтому план смотрела по запросу из тела функции.
 
 ---
@@ -747,6 +830,7 @@ SELECT 'client' AS tbl, count(*) FROM client
 UNION ALL SELECT 'courier', count(*) FROM courier
 UNION ALL SELECT 'product_category', count(*) FROM product_category
 UNION ALL SELECT 'restaurant', count(*) FROM restaurant
+UNION ALL SELECT 'legal_entity', count(*) FROM legal_entity
 UNION ALL SELECT 'address', count(*) FROM address
 UNION ALL SELECT 'product', count(*) FROM product
 UNION ALL SELECT 'order', count(*) FROM "order"

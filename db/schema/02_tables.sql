@@ -52,39 +52,70 @@ CREATE TABLE bokareva_food.client_address (
 CREATE INDEX client_address_address_idx ON bokareva_food.client_address (address_id);
 
 
+-- юрлица (реквизиты ресторанов), BR-4.5
+-- раньше реквизиты лежали одной строкой restaurant.company_details - это нарушало 1НФ
+-- (в одном поле три значения: ИНН, ОГРН, р/с). Разбить на три колонки прямо в restaurant
+-- тоже плохо: у сети ресторанов одно юрлицо, и ОГРН/счёт зависели бы от ИНН,
+-- а не от restaurant_id - транзитивная зависимость, нарушение 3НФ.
+-- Поэтому юрлицо - отдельная таблица, ресторан ссылается на неё.
+CREATE TABLE bokareva_food.legal_entity (
+    legal_entity_id uuid        NOT NULL DEFAULT exts.uuid_generate_v4(),
+    inn             varchar(12) NOT NULL,          -- 10 цифр у организации, 12 у ИП
+    ogrn            varchar(15) NOT NULL,          -- 13 цифр ОГРН у организации, 15 ОГРНИП у ИП
+    bank_account    char(20)    NOT NULL,          -- расчётный счёт всегда 20 цифр
+    CONSTRAINT legal_entity_pk PRIMARY KEY (legal_entity_id),
+    CONSTRAINT legal_entity_inn_uq  UNIQUE (inn),
+    CONSTRAINT legal_entity_ogrn_uq UNIQUE (ogrn),
+    CONSTRAINT legal_entity_inn_format_chk  CHECK (inn  ~ '^[0-9]{10}([0-9]{2})?$'),
+    CONSTRAINT legal_entity_ogrn_format_chk CHECK (ogrn ~ '^[0-9]{13}([0-9]{2})?$'),
+    -- организация: ИНН 10 + ОГРН 13; ИП: ИНН 12 + ОГРНИП 15. Смешивать нельзя
+    CONSTRAINT legal_entity_inn_ogrn_match_chk
+        CHECK ((char_length(inn) = 10) = (char_length(ogrn) = 13)),
+    CONSTRAINT legal_entity_bank_account_format_chk CHECK (bank_account ~ '^[0-9]{20}$')
+);
+
+
 -- рестораны
 CREATE TABLE bokareva_food.restaurant (
     restaurant_id   uuid         NOT NULL DEFAULT exts.uuid_generate_v4(),
     restaurant_name varchar(100) NOT NULL,
     address_id      uuid         NOT NULL,
-    description     text         NOT NULL,
+    legal_entity_id uuid         NOT NULL,
+    description     text         NULL,             -- описания может не быть
     work_start      time         NOT NULL,
     work_end        time         NOT NULL,
-    company_details text         NOT NULL,
     rating          numeric(3,2) NULL,             -- нет отзывов - нет рейтинга
     status          bokareva_food.restaurant_status NOT NULL DEFAULT 'активен',
     CONSTRAINT restaurant_pk PRIMARY KEY (restaurant_id),
     CONSTRAINT restaurant_address_uq UNIQUE (address_id),
     CONSTRAINT restaurant_address_fk FOREIGN KEY (address_id)
         REFERENCES bokareva_food.address (address_id) ON DELETE RESTRICT,
-    CONSTRAINT restaurant_name_not_blank_chk    CHECK (btrim(restaurant_name) <> ''),
-    CONSTRAINT restaurant_details_not_blank_chk CHECK (btrim(company_details) <> ''),
-    CONSTRAINT restaurant_work_hours_chk        CHECK (work_end > work_start),
-    CONSTRAINT restaurant_rating_chk            CHECK (rating BETWEEN 0 AND 5)
+    CONSTRAINT restaurant_legal_entity_fk FOREIGN KEY (legal_entity_id)
+        REFERENCES bokareva_food.legal_entity (legal_entity_id) ON DELETE RESTRICT,
+    CONSTRAINT restaurant_name_not_blank_chk        CHECK (btrim(restaurant_name) <> ''),
+    CONSTRAINT restaurant_description_not_blank_chk CHECK (description IS NULL OR btrim(description) <> ''),
+    CONSTRAINT restaurant_work_hours_chk            CHECK (work_end > work_start),
+    CONSTRAINT restaurant_rating_chk                CHECK (rating BETWEEN 0 AND 5)
 );
+CREATE INDEX restaurant_legal_entity_idx ON bokareva_food.restaurant (legal_entity_id);
 
 
 -- курьеры
+-- ФИО разбито на три поля (1НФ). Отчества у человека может не быть
 CREATE TABLE bokareva_food.courier (
     courier_id     uuid         NOT NULL DEFAULT exts.uuid_generate_v4(),
-    fio            varchar(150) NOT NULL,
+    last_name      varchar(50)  NOT NULL,
+    first_name     varchar(50)  NOT NULL,
+    patronymic     varchar(50)  NULL,
     phone_number   char(12)     NOT NULL,
     status         bokareva_food.courier_status NOT NULL DEFAULT 'свободен',
     hire_date      date         NOT NULL DEFAULT current_date,
     dismissal_date date         NULL,              -- пока работает - пусто
     coefficient    numeric(3,2) NOT NULL DEFAULT 0.1,  -- новичкам 0.1 (BR-6.5)
     CONSTRAINT courier_pk PRIMARY KEY (courier_id),
-    CONSTRAINT courier_fio_not_blank_chk  CHECK (btrim(fio) <> ''),
+    CONSTRAINT courier_last_name_not_blank_chk  CHECK (btrim(last_name) <> ''),
+    CONSTRAINT courier_first_name_not_blank_chk CHECK (btrim(first_name) <> ''),
+    CONSTRAINT courier_patronymic_not_blank_chk CHECK (patronymic IS NULL OR btrim(patronymic) <> ''),
     CONSTRAINT courier_phone_format_chk   CHECK (phone_number ~ '^\+7[0-9]{10}$'),
     CONSTRAINT courier_coefficient_chk    CHECK (coefficient BETWEEN 0.1 AND 0.5),
     CONSTRAINT courier_dismissed_has_date_chk
@@ -96,11 +127,11 @@ CREATE TABLE bokareva_food.courier (
 
 -- зарплата курьеров по месяцам
 CREATE TABLE bokareva_food.courier_pay (
-    year             smallint      NOT NULL,
-    month            smallint      NOT NULL,
-    courier_id       uuid          NOT NULL,
-    amount           numeric(12,2) NOT NULL,
-    coefficient_used numeric(3,2)  NOT NULL,
+    year             smallint     NOT NULL,
+    month            smallint     NOT NULL,
+    courier_id       uuid         NOT NULL,
+    amount           numeric(8,2) NOT NULL,        -- до 999 999.99 в месяц
+    coefficient_used numeric(3,2) NOT NULL,
     -- на курьера одна запись в месяц, BR-10.3
     CONSTRAINT courier_pay_pk PRIMARY KEY (year, month, courier_id),
     CONSTRAINT courier_pay_courier_fk FOREIGN KEY (courier_id)
@@ -124,24 +155,25 @@ CREATE TABLE bokareva_food.product_category (
 
 -- блюда
 CREATE TABLE bokareva_food.product (
-    product_id          uuid          NOT NULL DEFAULT exts.uuid_generate_v4(),
-    product_name        varchar(100)  NOT NULL,
-    product_category_id uuid          NOT NULL,
-    price               numeric(10,2) NOT NULL,
-    restaurant_id       uuid          NOT NULL,
-    photo_url           text          NULL,        -- фото может не быть
-    rating              numeric(3,2)  NULL,        -- считает триггер, без отзывов NULL
+    product_id          uuid         NOT NULL DEFAULT exts.uuid_generate_v4(),
+    product_name        varchar(100) NOT NULL,
+    product_category_id uuid         NOT NULL,
+    price               numeric(7,2) NOT NULL,     -- до 99 999.99 за блюдо
+    restaurant_id       uuid         NOT NULL,
+    photo_url           text         NULL,         -- фото может не быть
+    rating              numeric(3,2) NULL,         -- считает триггер, без отзывов NULL
     status              bokareva_food.product_status NOT NULL DEFAULT 'доступно',
-    description         text          NOT NULL,
+    description         text         NULL,         -- описания может не быть
     CONSTRAINT product_pk PRIMARY KEY (product_id),
     CONSTRAINT product_category_fk FOREIGN KEY (product_category_id)
         REFERENCES bokareva_food.product_category (product_category_id) ON DELETE RESTRICT,
     CONSTRAINT product_restaurant_fk FOREIGN KEY (restaurant_id)
         REFERENCES bokareva_food.restaurant (restaurant_id) ON DELETE RESTRICT,
-    CONSTRAINT product_name_not_blank_chk CHECK (btrim(product_name) <> ''),
-    CONSTRAINT product_price_chk          CHECK (price >= 0),
-    CONSTRAINT product_rating_chk         CHECK (rating BETWEEN 0 AND 5),
-    CONSTRAINT product_photo_not_blank_chk CHECK (photo_url IS NULL OR btrim(photo_url) <> '')
+    CONSTRAINT product_name_not_blank_chk        CHECK (btrim(product_name) <> ''),
+    CONSTRAINT product_price_chk                 CHECK (price >= 0),
+    CONSTRAINT product_rating_chk                CHECK (rating BETWEEN 0 AND 5),
+    CONSTRAINT product_photo_not_blank_chk       CHECK (photo_url IS NULL OR btrim(photo_url) <> ''),
+    CONSTRAINT product_description_not_blank_chk CHECK (description IS NULL OR btrim(description) <> '')
 );
 CREATE INDEX product_restaurant_idx ON bokareva_food.product (restaurant_id);
 CREATE INDEX product_category_idx   ON bokareva_food.product (product_category_id);
@@ -149,20 +181,20 @@ CREATE INDEX product_category_idx   ON bokareva_food.product (product_category_i
 
 -- заказы. имя в кавычках - order зарезервировано, переименовывать не стала
 CREATE TABLE bokareva_food."order" (
-    order_id           uuid          NOT NULL DEFAULT exts.uuid_generate_v4(),
-    courier_id         uuid          NOT NULL,
-    client_id          uuid          NOT NULL,
-    address_id         uuid          NOT NULL,
-    restaurant_id      uuid          NOT NULL,
-    order_timestamp    timestamp     NOT NULL DEFAULT localtimestamp,
-    delivery_timestamp timestamp     NULL,         -- заполняется когда доставили
-    order_amount       numeric(12,2) NOT NULL,
+    order_id           uuid         NOT NULL DEFAULT exts.uuid_generate_v4(),
+    courier_id         uuid         NOT NULL,
+    client_id          uuid         NOT NULL,
+    address_id         uuid         NOT NULL,
+    restaurant_id      uuid         NOT NULL,
+    order_timestamp    timestamp    NOT NULL DEFAULT localtimestamp,
+    delivery_timestamp timestamp    NULL,          -- заполняется когда доставили
+    order_amount       numeric(8,2) NOT NULL,      -- до 999 999.99 за заказ
     -- комиссия 10% и итог считает сама база, руками их не записать (BR-1.4, 7.10)
-    commission         numeric(12,2) GENERATED ALWAYS AS (round(order_amount * 0.10, 2)) STORED,
-    total_amount       numeric(12,2) GENERATED ALWAYS AS (order_amount + round(order_amount * 0.10, 2)) STORED,
+    commission         numeric(8,2) GENERATED ALWAYS AS (round(order_amount * 0.10, 2)) STORED,
+    total_amount       numeric(9,2) GENERATED ALWAYS AS (order_amount + round(order_amount * 0.10, 2)) STORED,
     status             bokareva_food.order_status     NOT NULL DEFAULT 'создан',
     pay_status         bokareva_food.order_pay_status NOT NULL DEFAULT 'ожидает',
-    description        text          NOT NULL,
+    description        text         NULL,          -- комментарий клиента, необязателен
     CONSTRAINT order_pk PRIMARY KEY (order_id),
     CONSTRAINT order_courier_fk FOREIGN KEY (courier_id)
         REFERENCES bokareva_food.courier (courier_id) ON DELETE RESTRICT,
@@ -184,7 +216,7 @@ CREATE TABLE bokareva_food."order" (
         CHECK (delivery_timestamp IS NULL OR delivery_timestamp >= order_timestamp),
     CONSTRAINT order_delivered_has_time_chk
         CHECK (status <> 'доставлен' OR delivery_timestamp IS NOT NULL),
-    CONSTRAINT order_description_not_blank_chk CHECK (btrim(description) <> '')
+    CONSTRAINT order_description_not_blank_chk CHECK (description IS NULL OR btrim(description) <> '')
 );
 CREATE INDEX order_courier_idx    ON bokareva_food."order" (courier_id);
 CREATE INDEX order_client_idx     ON bokareva_food."order" (client_id, address_id);
@@ -196,7 +228,7 @@ CREATE INDEX order_status_ts_idx  ON bokareva_food."order" (status, order_timest
 CREATE TABLE bokareva_food.order_structure (
     order_id   uuid         NOT NULL,
     product_id uuid         NOT NULL,
-    quantity   numeric(8,3) NOT NULL,              -- бывает 0.5 кг, поэтому не int
+    quantity   numeric(5,3) NOT NULL,              -- бывает 0.5 кг, поэтому не int; до 99.999
     -- одно блюдо в заказе один раз, иначе увеличиваем количество (BR-7.16)
     CONSTRAINT order_structure_pk PRIMARY KEY (order_id, product_id),
     CONSTRAINT order_structure_order_fk FOREIGN KEY (order_id)
@@ -210,13 +242,13 @@ CREATE INDEX order_structure_product_idx ON bokareva_food.order_structure (produ
 
 -- попытки оплаты
 CREATE TABLE bokareva_food.payment (
-    payment_id        uuid          NOT NULL DEFAULT exts.uuid_generate_v4(),
-    order_id          uuid          NOT NULL,
+    payment_id        uuid         NOT NULL DEFAULT exts.uuid_generate_v4(),
+    order_id          uuid         NOT NULL,
     payment_type      bokareva_food.payment_type   NOT NULL,
-    amount            numeric(12,2) NOT NULL,
+    amount            numeric(9,2) NOT NULL,
     -- id от платёжки это строка а не uuid, поэтому назвала _ref а не _id
-    transaction_ref   varchar(64)   NOT NULL,
-    payment_timestamp timestamp     NOT NULL DEFAULT localtimestamp,
+    transaction_ref   varchar(64)  NOT NULL,
+    payment_timestamp timestamp    NOT NULL DEFAULT localtimestamp,
     status            bokareva_food.payment_status NOT NULL DEFAULT 'в_обработке',
     CONSTRAINT payment_pk PRIMARY KEY (payment_id),
     CONSTRAINT payment_order_fk FOREIGN KEY (order_id)

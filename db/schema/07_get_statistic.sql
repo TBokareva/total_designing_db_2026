@@ -1,7 +1,4 @@
 -- FOOD-106 get_statistic
--- order читаю один раз (cte delivered), дальше всё считается от него.
--- лучшее блюдо/клиента беру через distinct on - без оконных функций.
--- при равенстве выбирается случайный за счёт random() в сортировке
 
 SET search_path TO bokareva_food, exts;
 
@@ -17,7 +14,7 @@ LANGUAGE sql
 STABLE
 SET search_path = bokareva_food, exts
 AS $$
-    WITH delivered AS MATERIALIZED (
+    WITH delivered AS (
         SELECT o.order_id, o.restaurant_id, o.client_id, o.total_amount
         FROM "order" o
         WHERE o.status = 'доставлен'
@@ -29,22 +26,40 @@ AS $$
         FROM delivered d
         GROUP BY d.restaurant_id
     ),
-    best_product AS (   -- что чаще всего берут
-        SELECT DISTINCT ON (d.restaurant_id)
-               d.restaurant_id, p.product_name
+    product_qty AS (    -- сколько куплено каждого блюда
+        SELECT d.restaurant_id, os.product_id, sum(os.quantity) AS qty
         FROM delivered d
-        JOIN order_structure os ON os.order_id   = d.order_id
-        JOIN product p          ON p.product_id  = os.product_id
-        GROUP BY d.restaurant_id, p.product_id, p.product_name
-        ORDER BY d.restaurant_id, sum(os.quantity) DESC, random()
+        JOIN order_structure os ON os.order_id = d.order_id
+        GROUP BY d.restaurant_id, os.product_id
     ),
-    best_client AS (    -- кто чаще всего заказывает. фио у клиента нет, поэтому логин
-        SELECT DISTINCT ON (d.restaurant_id)
-               d.restaurant_id, c.login
+    best_product AS (
+        SELECT pq.restaurant_id,
+               (array_agg(p.product_name ORDER BY random()))[1] AS product_name
+        FROM product_qty pq
+        JOIN (SELECT restaurant_id, max(qty) AS max_qty
+              FROM product_qty
+              GROUP BY restaurant_id) m
+          ON m.restaurant_id = pq.restaurant_id
+         AND m.max_qty       = pq.qty
+        JOIN product p ON p.product_id = pq.product_id
+        GROUP BY pq.restaurant_id
+    ),
+    client_cnt AS (     -- сколько доставленных заказов у каждого клиента
+        SELECT d.restaurant_id, d.client_id, count(*) AS cnt
         FROM delivered d
-        JOIN client c ON c.client_id = d.client_id
-        GROUP BY d.restaurant_id, c.client_id, c.login
-        ORDER BY d.restaurant_id, count(*) DESC, random()
+        GROUP BY d.restaurant_id, d.client_id
+    ),
+    best_client AS (
+        SELECT cc.restaurant_id,
+               (array_agg(c.login ORDER BY random()))[1] AS login
+        FROM client_cnt cc
+        JOIN (SELECT restaurant_id, max(cnt) AS max_cnt
+              FROM client_cnt
+              GROUP BY restaurant_id) m
+          ON m.restaurant_id = cc.restaurant_id
+         AND m.max_cnt       = cc.cnt
+        JOIN client c ON c.client_id = cc.client_id
+        GROUP BY cc.restaurant_id
     )
     SELECT r.restaurant_name,
            bp.product_name,
